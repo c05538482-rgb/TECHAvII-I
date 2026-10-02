@@ -1,111 +1,41 @@
 (() => {
   'use strict';
-  const VAPID_URL = '/api/push/public-key';
-  const SUB_URL = '/api/push/subscribe';
-  const TEST_URL = '/api/push/test';
-
-  function b64ToBytes(base64) {
-    const padding = '='.repeat((4 - base64.length % 4) % 4);
-    const raw = atob((base64 + padding).replace(/-/g, '+').replace(/_/g, '/'));
-    return Uint8Array.from([...raw].map(c => c.charCodeAt(0)));
+  const VAPID_URL='/api/push/public-key', SUB_URL='/api/push/subscribe', STATUS_URL='/api/push/status', TEST_URL='/api/push/test';
+  const $=s=>document.querySelector(s);
+  function b64ToBytes(base64){const padding='='.repeat((4-base64.length%4)%4);const raw=atob((base64+padding).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from([...raw].map(c=>c.charCodeAt(0)));}
+  async function jsonFetch(url,opts={}){const r=await fetch(url,{credentials:'include',...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||`HTTP ${r.status}`);return j;}
+  async function getUser(){try{return (await jsonFetch('/api/auth/me')).user||null}catch{return null}}
+  function makeButton(){let b=$('#techaviPushButton');if(b)return b;b=document.createElement('button');b.id='techaviPushButton';b.className='push-manage';b.type='button';b.textContent='🔔 Bildirimleri Aç';document.body.appendChild(b);return b;}
+  async function getReadyRegistration(){await navigator.serviceWorker.register('/sw.js?v=8',{scope:'/'});return navigator.serviceWorker.ready;}
+  async function currentStatus(){const user=await getUser();if(!user)return{user:null};let server={};try{server=await jsonFetch(STATUS_URL)}catch{}let sub=null;if('serviceWorker'in navigator){try{const reg=await getReadyRegistration();sub=await reg.pushManager.getSubscription()}catch{}}return{user,server,sub,permission:Notification.permission};}
+  async function syncSubscription(force=false){
+    if(!window.isSecureContext)throw new Error('Bildirimler HTTPS bağlantısında çalışır.');
+    const user=await getUser();if(!user)throw new Error('Önce TechAvı hesabına giriş yapmalısın.');
+    if(!('serviceWorker'in navigator)||!('PushManager'in window)||!('Notification'in window))throw new Error('Bu tarayıcı push bildirimlerini desteklemiyor.');
+    const keyData=await jsonFetch(VAPID_URL);if(!keyData.publicKey)throw new Error('Sunucuda VAPID anahtarları eksik.');
+    const permission=await Notification.requestPermission();if(permission!=='granted')throw new Error('Bildirim izni verilmedi. Tarayıcı/site ayarlarından izin ver.');
+    const reg=await getReadyRegistration();let sub=await reg.pushManager.getSubscription();
+    if(force&&sub){try{await jsonFetch(SUB_URL,{method:'DELETE',body:JSON.stringify({endpoint:sub.endpoint})})}catch{}try{await sub.unsubscribe()}catch{}sub=null;}
+    if(!sub)sub=await reg.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:b64ToBytes(keyData.publicKey)});
+    await jsonFetch(SUB_URL,{method:'POST',body:JSON.stringify({subscription:sub.toJSON()})});
+    return sub;
   }
-
-  async function getUser() {
-    try { const r = await fetch('/api/auth/me', { credentials: 'include' }); return (await r.json()).user || null; }
-    catch (_) { return null; }
+  async function openManager(){
+    const user=await getUser();if(!user){alert('Önce TechAvı hesabına giriş yapmalısın.');return;}
+    let st;try{st=await currentStatus()}catch(e){alert(e.message);return;}
+    const text=`Bildirim izni: ${st.permission==='granted'?'Açık':st.permission==='denied'?'Engelli':'Sorulmadı'}\nBu cihaz aboneliği: ${st.sub?'Var':'Yok'}\nSunucudaki abonelik: ${st.server?.subscriptions||0}`;
+    const choice=confirm(text+'\n\nTamam = bildirimi yeniden bağla ve test et\nİptal = yalnızca durumu göster');
+    if(!choice)return;
+    const b=makeButton();b.disabled=true;b.textContent='⏳ Bağlanıyor…';
+    try{await syncSubscription(true);const t=await jsonFetch(TEST_URL,{method:'POST',body:'{}'});b.textContent='✅ Bildirimler Açık';setTimeout(()=>b.textContent='🔔 Bildirimleri Yönet',1800);if(!t?.stats?.sent)alert('Abonelik kaydedildi ancak test bildirimi gönderilemedi.');}
+    catch(e){b.textContent='⚠️ Bildirimi Düzelt';alert('Bildirim kurulamadı: '+e.message);}finally{b.disabled=false;}
   }
-
-  function makeButton() {
-    let b = document.getElementById('techaviPushButton');
-    if (b) return b;
-    b = document.createElement('button');
-    b.id = 'techaviPushButton';
-    b.type = 'button';
-    b.textContent = '🔔 Bildirimleri Aç';
-    Object.assign(b.style, {
-      position:'fixed', right:'18px', bottom:'18px', zIndex:'99999',
-      border:'1px solid rgba(255,255,255,.18)', borderRadius:'999px',
-      padding:'11px 16px', background:'rgba(15,20,30,.96)', color:'#fff',
-      boxShadow:'0 8px 30px rgba(0,0,0,.35)', cursor:'pointer', fontWeight:'700'
-    });
-    document.body.appendChild(b);
-    return b;
+  async function boot(){
+    if(!window.isSecureContext||!('Notification'in window)||!('serviceWorker'in navigator)||!('PushManager'in window))return;
+    const user=await getUser();if(!user)return;const b=makeButton();b.onclick=openManager;
+    try{const st=await currentStatus();if(st.permission==='granted'&&st.sub){b.textContent='🔔 Bildirimleri Yönet';await jsonFetch(SUB_URL,{method:'POST',body:JSON.stringify({subscription:st.sub.toJSON()})}).catch(()=>{});}else if(st.permission==='denied')b.textContent='⚠️ Bildirim Engelli';}
+    catch{b.textContent='🔔 Bildirimleri Aç';}
   }
-
-  async function enablePush() {
-    const user = await getUser();
-    if (!user) { alert('Önce TechAvı hesabına giriş yapmalısın.'); return; }
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) { alert('Bu tarayıcı push bildirimlerini desteklemiyor.'); return; }
-    const keyRes = await fetch(VAPID_URL, { credentials:'include' });
-    const keyData = await keyRes.json();
-    if (!keyData.ok || !keyData.publicKey) { alert('Bildirim sistemi henüz yapılandırılmamış.'); return; }
-    const permission = await Notification.requestPermission();
-    if (permission !== 'granted') { alert('Bildirim izni verilmedi.'); return; }
-    const reg = await navigator.serviceWorker.register('/sw.js', { scope:'/' });
-    // Register returns before activation on some browsers; wait until an active worker exists.
-    const activeReg = await navigator.serviceWorker.ready;
-    const existing = await activeReg.pushManager.getSubscription();
-    const sub = existing || await activeReg.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey:b64ToBytes(keyData.publicKey) });
-    const r = await fetch(SUB_URL, { method:'POST', credentials:'include', headers:{'Content-Type':'application/json'}, body:JSON.stringify({subscription:sub.toJSON()}) });
-    const result = await r.json();
-    if (!result.ok) throw new Error(result.error || 'Abonelik başarısız');
-    const button = makeButton();
-    button.textContent = '✅ Bildirimler Açık';
-    button.style.opacity = '.75';
-    try { await fetch(TEST_URL, { method:'POST', credentials:'include' }); } catch (_) {}
-  }
-
-
-  const extraStores = [
-    ['amazon', 'Amazon Türkiye', '🟠'],
-    ['pazarama', 'Pazarama', '🟣'],
-    ['ciceksepeti', 'Çiçeksepeti', '🌸']
-  ];
-  function renderExtraStores(payload) {
-    const stores = payload?.stores || {};
-    const available = extraStores.filter(([id]) => stores[id]);
-    if (!available.length) return;
-    let panel = document.getElementById('techaviExtraStores');
-    if (!panel) {
-      panel = document.createElement('section');
-      panel.id = 'techaviExtraStores';
-      panel.innerHTML = `<div style="font-size:18px;font-weight:800;margin:18px 0 10px">🛒 Yeni Mağazalar</div><div class="techavi-extra-grid"></div>`;
-      Object.assign(panel.style, {margin:'10px auto 24px',maxWidth:'1180px',padding:'0 16px'});
-      document.body.appendChild(panel);
-    }
-    const grid = panel.querySelector('.techavi-extra-grid');
-    grid.innerHTML = available.map(([id,name,icon]) => {
-      const s = stores[id] || {};
-      const count = Number(s.count || s.products?.length || 0);
-      return `<div style="display:inline-flex;align-items:center;gap:10px;margin:5px;padding:10px 14px;border:1px solid rgba(255,255,255,.12);border-radius:14px;background:rgba(255,255,255,.04)"><span style="font-size:20px">${icon}</span><b>${name}</b><span style="opacity:.7">${count} sonuç</span></div>`;
-    }).join('');
-  }
-
-  function hookSearchResults() {
-    if (window.__techaviFetchHooked) return;
-    window.__techaviFetchHooked = true;
-    const originalFetch = window.fetch.bind(window);
-    window.fetch = async (...args) => {
-      const response = await originalFetch(...args);
-      try {
-        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
-        if (url.includes('/api/search')) {
-          response.clone().json().then(renderExtraStores).catch(() => {});
-        }
-      } catch (_) {}
-      return response;
-    };
-  }
-
-  async function boot() {
-    hookSearchResults();
-    if (!window.isSecureContext) return;
-    const user = await getUser();
-    if (!user) return;
-    if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
-    const button = makeButton();
-    if (Notification.permission === 'granted') button.textContent = '🔔 Bildirimleri Yönet';
-    button.addEventListener('click', () => enablePush().catch(e => { console.error(e); alert('Bildirim kurulamadı: ' + e.message); }));
-  }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
+  window.TechaviPush={enable:()=>syncSubscription(false),repair:()=>syncSubscription(true),status:currentStatus,test:()=>jsonFetch(TEST_URL,{method:'POST',body:'{}'})};
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot);else boot();setInterval(boot,15000);
 })();

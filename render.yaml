@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: techav1-v2
+    name: techav1-v3
     runtime: node
     plan: free
     buildCommand: npm install
@@ -10,6 +10,8 @@ services:
         value: production
       - key: REEF_API_KEY
         sync: false
+      - key: BRIGHTDATA_API_KEY
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: SESSION_SECRET
@@ -17,6 +19,12 @@ services:
       - key: RESEND_API_KEY
         sync: false
       - key: JOB_SECRET
+        sync: false
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
         sync: false
       - key: RESEND_FROM
         value: "TechAvı <onboarding@resend.dev>"

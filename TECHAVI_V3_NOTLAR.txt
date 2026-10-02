@@ -1,0 +1,48 @@
+TECHAVI V3 - EKLENENLER
+======================
+
+1. 7/30/180 günlük fiyat geçmişi grafiği
+2. 30 gün / tüm zaman dip fiyat bilgisi
+3. Fiyat düşüş yüzdesi
+4. Mağaza karşılaştırma
+5. Akıllı alarm: hedef fiyat / yüzde düşüş / 30 gün dip / stok
+6. Hesaba bağlı favoriler ve takip listesi
+7. Alarm geçmişi
+8. Son aramalar
+9. Popüler aramalar
+10. Kategori sistemi
+11. Fiyat/mağaza/marka/indirim/stok filtreleri
+12. En ucuz/en pahalı/en çok düşen/indirim sıralaması
+13. Gerçek fırsatlar
+14. En çok fiyatı düşenler
+15. Dip fiyatlar
+16. Ürün takip listesi
+17. Stok alarmı
+18. Mağaza bazlı alarm
+19. Gelişmiş ürün detay sayfası
+20. Benzer ürünler
+21. İyi/Normal/Yüksek fiyat analizi
+22. Geliştirilmiş PWA/offline shell
+23. Push bildirim aboneliği onarma/test akışı
+24. Koyu/açık tema
+25. Kullanıcı hesabı
+26. Google giriş desteği (GOOGLE_CLIENT_ID gerekir)
+27. Bildirim merkezi
+28. Bugün ne düştü özeti
+
+BİLDİRİM İÇİN:
+- Site HTTPS üzerinde olmalı.
+- VAPID_PUBLIC_KEY ve VAPID_PRIVATE_KEY Render ortam değişkenlerinde olmalı.
+- Anahtar üretmek için: npm run vapid
+- Kullanıcı giriş yaptıktan sonra sağ alttaki “Bildirimleri Aç/Yönet” düğmesini kullanır.
+- Düğme mevcut aboneliği onarabilir ve gerçek test bildirimi gönderir.
+
+GOOGLE GİRİŞ:
+- Google Cloud Console'dan Web OAuth Client ID oluşturun.
+- Render'a GOOGLE_CLIENT_ID olarak ekleyin.
+- Ayarlanmazsa Google düğmesi gizli kalır; normal e-posta/şifre girişi çalışır.
+
+FİYAT GEÇMİŞİ:
+- Sahte veri oluşturulmaz.
+- Arama ve alarm kontrollerinde gerçek fiyat gözlemleri price_history tablosuna yazılır.
+- Yeni kurulumda geçmiş sayfalarının dolması zaman alır.

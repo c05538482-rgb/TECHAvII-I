@@ -10,6 +10,8 @@ const fs = require("fs");
 const path = require("path");
 const { Resend } = require("resend");
 const webpush = require("web-push");
+let OAuth2Client = null;
+try { ({ OAuth2Client } = require("google-auth-library")); } catch (_) {}
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
@@ -21,6 +23,7 @@ const CACHE_TTL = Math.max(60, Number(process.env.CACHE_TTL_SECONDS || 600));
 const ALARM_INTERVAL = Math.max(5, Number(process.env.ALARM_INTERVAL_MINUTES || 30));
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   webpush.setVapidDetails("mailto:alerts@techavi.onrender.com", VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 }
@@ -108,6 +111,46 @@ async function initDb() {
       last_used_at TIMESTAMPTZ
     );
     CREATE INDEX IF NOT EXISTS push_subscriptions_user_idx ON push_subscriptions(user_id);
+
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT;
+    ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+
+    ALTER TABLE alarms ADD COLUMN IF NOT EXISTS alarm_type TEXT NOT NULL DEFAULT 'price';
+    ALTER TABLE alarms ADD COLUMN IF NOT EXISTS percent_drop NUMERIC;
+    ALTER TABLE alarms ADD COLUMN IF NOT EXISTS baseline_price NUMERIC;
+    ALTER TABLE alarms ADD COLUMN IF NOT EXISTS stock_only BOOLEAN NOT NULL DEFAULT FALSE;
+
+    CREATE TABLE IF NOT EXISTS product_catalog (
+      product_key TEXT PRIMARY KEY, store TEXT NOT NULL, product_id TEXT, title TEXT NOT NULL,
+      brand TEXT, category TEXT, url TEXT, image TEXT, current_price NUMERIC, original_price NUMERIC,
+      stock BOOLEAN, last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS product_catalog_seen_idx ON product_catalog(last_seen_at DESC);
+
+    CREATE TABLE IF NOT EXISTS price_history (
+      id BIGSERIAL PRIMARY KEY, product_key TEXT NOT NULL REFERENCES product_catalog(product_key) ON DELETE CASCADE,
+      price NUMERIC NOT NULL, original_price NUMERIC, stock BOOLEAN, observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS price_history_product_idx ON price_history(product_key, observed_at DESC);
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE, product_key TEXT NOT NULL,
+      snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(user_id, product_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS search_events (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      query TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS search_events_query_idx ON search_events(query, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS notification_events (
+      id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      alarm_id BIGINT REFERENCES alarms(id) ON DELETE SET NULL, type TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL,
+      url TEXT, read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS notification_events_user_idx ON notification_events(user_id, created_at DESC);
   `);
 }
 
@@ -1123,6 +1166,53 @@ app.post("/api/auth/logout", (req, res) => {
   req.session.destroy(() => res.json({ ok: true }));
 });
 
+
+function productKey(p) {
+  const store = String(p?.store || "unknown").toLowerCase();
+  const id = String(p?.id || p?.product_id || "").trim();
+  if (id) return `${store}:${id}`;
+  return `${store}:` + crypto.createHash("sha1").update(normalizeQuery(p?.title || "") + "|" + String(p?.url || "")).digest("hex");
+}
+
+function inferCategory(title="") {
+  const t = normalizeQuery(title);
+  const rules = [
+    ["Ekran Kartı", /rtx|radeon|geforce|ekran kart/], ["Laptop", /laptop|notebook|macbook/],
+    ["Telefon", /iphone|galaxy|telefon|smartphone|xiaomi|redmi|poco/], ["SSD", /\bssd\b|nvme/],
+    ["RAM", /\bram\b|ddr4|ddr5/], ["Monitör", /monitor|monitör/], ["İşlemci", /ryzen|core i[3579]|işlemci|cpu/],
+    ["Anakart", /anakart|motherboard|b650|x670|z790|b760/], ["Konsol", /playstation|ps5|xbox|switch/],
+    ["Beyaz Eşya", /buzdolabı|çamaşır|bulaşık|kurutma|fırın/]
+  ];
+  return (rules.find(([,r]) => r.test(t)) || ["Diğer"])[0];
+}
+
+async function recordProducts(products=[]) {
+  if (!Array.isArray(products) || !products.length) return;
+  for (const p of products) { p.productKey = productKey(p); p.category = p.category || inferCategory(p.title); }
+  if (!DATABASE_URL) return;
+  for (const p of products.slice(0, 120)) {
+    const price = num(p.price); if (!price || price <= 0) continue;
+    const key = p.productKey;
+    const category = p.category;
+    try {
+      await db(`INSERT INTO product_catalog(product_key,store,product_id,title,brand,category,url,image,current_price,original_price,stock,last_seen_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+        ON CONFLICT(product_key) DO UPDATE SET title=EXCLUDED.title,brand=EXCLUDED.brand,category=EXCLUDED.category,url=EXCLUDED.url,image=EXCLUDED.image,current_price=EXCLUDED.current_price,original_price=EXCLUDED.original_price,stock=EXCLUDED.stock,last_seen_at=NOW()`,
+        [key, String(p.store||""), String(p.id||p.product_id||"")||null, String(p.title||"Ürün"), p.brand||null, category, p.url||null, p.image||null, price, num(p.originalPrice), p.stock == null ? null : Boolean(p.stock)]);
+      const last = await db(`SELECT price,observed_at FROM price_history WHERE product_key=$1 ORDER BY observed_at DESC LIMIT 1`, [key]);
+      const lastPrice = Number(last.rows[0]?.price || 0); const lastTime = last.rows[0]?.observed_at ? new Date(last.rows[0].observed_at).getTime() : 0;
+      if (!last.rows[0] || lastPrice !== Number(price) || Date.now() - lastTime > 6*60*60*1000) {
+        await db(`INSERT INTO price_history(product_key,price,original_price,stock) VALUES($1,$2,$3,$4)`, [key, price, num(p.originalPrice), p.stock == null ? null : Boolean(p.stock)]);
+      }
+    } catch (e) { console.warn("price history record", e.message); }
+  }
+}
+
+async function addNotification(userId, alarmId, type, title, body, url) {
+  if (!DATABASE_URL) return;
+  await db(`INSERT INTO notification_events(user_id,alarm_id,type,title,body,url) VALUES($1,$2,$3,$4,$5,$6)`, [userId, alarmId||null, type, title, body, url||null]);
+}
+
 const SEARCH_STORES = [
   "trendyol", "hepsiburada", "n11", "mediamarkt", "teknosa", "vatan",
   "amazon", "pazarama", "ciceksepeti", "boyner",
@@ -1176,6 +1266,8 @@ app.get("/api/search/store", async (req, res) => {
         reject(err);
       }, 45000))
     ]);
+    recordProducts(result.products || []).catch(()=>{});
+    if (DATABASE_URL && query && store === "trendyol") db("INSERT INTO search_events(user_id,query) VALUES($1,$2)", [req.session?.userId || null, query]).catch(()=>{});
     res.json({ ok: true, store, result });
   } catch (e) {
     console.error(`[SEARCH][${store}]`, e);
@@ -1205,6 +1297,76 @@ app.get("/api/search", async (req, res) => {
   res.json(buildSearchResponse(query, results, errors));
 });
 
+
+app.get("/api/config", (req,res) => res.json({ ok:true, googleClientId: GOOGLE_CLIENT_ID || null }));
+
+app.post("/api/auth/google", async (req,res) => {
+  try {
+    if (!GOOGLE_CLIENT_ID || !OAuth2Client) return res.status(503).json({ok:false,error:"Google giriş yapılandırılmadı."});
+    const credential = String(req.body?.credential || "");
+    const client = new OAuth2Client(GOOGLE_CLIENT_ID);
+    const ticket = await client.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+    if (!payload?.email || !payload?.sub) throw new Error("Google hesabı doğrulanamadı.");
+    const name = String(payload.name || payload.email.split("@")[0]).slice(0,80);
+    const r = await db(`INSERT INTO users(name,email,password_hash,google_sub) VALUES($1,$2,NULL,$3)
+      ON CONFLICT(email) DO UPDATE SET google_sub=EXCLUDED.google_sub,name=EXCLUDED.name RETURNING id,name,email`, [name,payload.email,payload.sub]);
+    req.session.userId = r.rows[0].id;
+    res.json({ok:true,user:r.rows[0]});
+  } catch(e) { res.status(401).json({ok:false,error:e.message || "Google giriş başarısız."}); }
+});
+
+app.get("/api/history", async (req,res) => {
+  try {
+    const key = String(req.query.key || ""); const days = Math.min(180, Math.max(1, Number(req.query.days||30)));
+    if (!key) return res.status(400).json({ok:false,error:"Ürün anahtarı gerekli."});
+    const r = await db(`SELECT price,original_price,stock,observed_at FROM price_history WHERE product_key=$1 AND observed_at >= NOW() - ($2 * INTERVAL '1 day') ORDER BY observed_at`, [key,days]);
+    const stats = await db(`SELECT MIN(price)::float min_price, MAX(price)::float max_price, AVG(price)::float avg_price FROM price_history WHERE product_key=$1`, [key]);
+    res.json({ok:true,history:r.rows,stats:stats.rows[0]||{}});
+  } catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.get("/api/discover", async (req,res) => {
+  try {
+    const mode = String(req.query.mode||"deals");
+    const limit = Math.min(80, Math.max(1, Number(req.query.limit||40)));
+    let order = "drop_pct DESC NULLS LAST";
+    if (mode === "lowest") order = "vs_avg_pct ASC NULLS LAST";
+    else if (mode === "drops") order = "drop_pct DESC NULLS LAST";
+    else if (mode === "today") order = "day_drop_pct DESC NULLS LAST";
+    const r = await db(`WITH hist AS (
+      SELECT product_key, MIN(price) FILTER (WHERE observed_at>=NOW()-INTERVAL '30 days') min30,
+        AVG(price) FILTER (WHERE observed_at>=NOW()-INTERVAL '30 days') avg30,
+        (ARRAY_AGG(price ORDER BY observed_at DESC))[1] latest,
+        (ARRAY_AGG(price ORDER BY observed_at ASC))[1] first_price,
+        MIN(price) all_min,
+        (ARRAY_AGG(price ORDER BY observed_at DESC) FILTER (WHERE observed_at<=NOW()-INTERVAL '1 day'))[1] day_ago
+      FROM price_history GROUP BY product_key)
+      SELECT c.*, h.min30::float,h.avg30::float,h.all_min::float,
+        CASE WHEN h.first_price>0 THEN ROUND(((h.first_price-h.latest)/h.first_price*100)::numeric,1) END drop_pct,
+        CASE WHEN h.avg30>0 THEN ROUND(((h.latest-h.avg30)/h.avg30*100)::numeric,1) END vs_avg_pct,
+        CASE WHEN h.day_ago>0 THEN ROUND(((h.day_ago-h.latest)/h.day_ago*100)::numeric,1) END day_drop_pct
+      FROM product_catalog c JOIN hist h USING(product_key)
+      WHERE c.current_price IS NOT NULL ORDER BY ${order} LIMIT $1`, [limit]);
+    res.json({ok:true,products:r.rows});
+  } catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.get("/api/searches", async (req,res)=>{
+  try {
+    const popular=await db(`SELECT query,COUNT(*)::int count FROM search_events WHERE created_at>=NOW()-INTERVAL '30 days' GROUP BY query ORDER BY count DESC LIMIT 10`);
+    let recent=[]; if(req.session?.userId){const rr=await db(`SELECT query,MAX(created_at) created_at FROM search_events WHERE user_id=$1 GROUP BY query ORDER BY created_at DESC LIMIT 10`,[req.session.userId]);recent=rr.rows;}
+    res.json({ok:true,popular:popular.rows,recent});
+  }catch(e){res.status(500).json({ok:false,error:e.message});}
+});
+
+app.get("/api/favorites", requireAuth, async(req,res)=>{ const r=await db(`SELECT product_key,snapshot,created_at FROM favorites WHERE user_id=$1 ORDER BY created_at DESC`,[req.session.userId]); res.json({ok:true,favorites:r.rows}); });
+app.post("/api/favorites", requireAuth, async(req,res)=>{ const p=req.body?.product||{}; const key=String(req.body?.productKey||productKey(p)); await db(`INSERT INTO favorites(user_id,product_key,snapshot) VALUES($1,$2,$3) ON CONFLICT(user_id,product_key) DO UPDATE SET snapshot=EXCLUDED.snapshot`,[req.session.userId,key,JSON.stringify(p)]); res.json({ok:true,productKey:key}); });
+app.delete("/api/favorites/:key", requireAuth, async(req,res)=>{ await db(`DELETE FROM favorites WHERE user_id=$1 AND product_key=$2`,[req.session.userId,decodeURIComponent(req.params.key)]); res.json({ok:true}); });
+
+app.get("/api/notifications", requireAuth, async(req,res)=>{ const r=await db(`SELECT * FROM notification_events WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`,[req.session.userId]); res.json({ok:true,notifications:r.rows,unread:r.rows.filter(x=>!x.read_at).length}); });
+app.post("/api/notifications/read", requireAuth, async(req,res)=>{ await db(`UPDATE notification_events SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL`,[req.session.userId]); res.json({ok:true}); });
+
 app.get("/api/push/public-key", (req, res) => {
   res.json({ ok: Boolean(VAPID_PUBLIC_KEY), publicKey: VAPID_PUBLIC_KEY || null });
 });
@@ -1232,74 +1394,65 @@ app.delete("/api/push/subscribe", requireAuth, async (req, res) => {
 });
 
 async function sendPushToUser(userId, payload) {
-  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !DATABASE_URL) return;
+  const stats = { total:0, sent:0, removed:0, failed:0 };
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY || !DATABASE_URL) return stats;
   const r = await db("SELECT id,endpoint,subscription FROM push_subscriptions WHERE user_id=$1", [userId]);
+  stats.total = r.rows.length;
   for (const row of r.rows) {
     try {
-      await webpush.sendNotification(row.subscription, JSON.stringify(payload), { TTL: 86400 });
+      await webpush.sendNotification(row.subscription, JSON.stringify(payload), { TTL: 86400, urgency: "high" });
+      stats.sent++;
       await db("UPDATE push_subscriptions SET last_used_at=NOW() WHERE id=$1", [row.id]);
     } catch (e) {
       if (e.statusCode === 404 || e.statusCode === 410) {
-        await db("DELETE FROM push_subscriptions WHERE id=$1", [row.id]);
+        stats.removed++; await db("DELETE FROM push_subscriptions WHERE id=$1", [row.id]);
       } else {
-        console.warn("Push gönderim hatası", row.id, e.message);
+        stats.failed++; console.warn("Push gönderim hatası", row.id, e.message);
       }
     }
   }
+  return stats;
 }
+
+app.get("/api/push/status", requireAuth, async (req,res) => {
+  try {
+    const r = await db("SELECT COUNT(*)::int count, MAX(last_used_at) last_used_at FROM push_subscriptions WHERE user_id=$1", [req.session.userId]);
+    res.json({ok:true, configured:Boolean(VAPID_PUBLIC_KEY&&VAPID_PRIVATE_KEY), subscriptions:r.rows[0]?.count||0, lastUsedAt:r.rows[0]?.last_used_at||null});
+  } catch(e){res.status(500).json({ok:false,error:e.message});}
+});
 
 app.post("/api/push/test", requireAuth, async (req, res) => {
   if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return res.status(503).json({ ok:false, error:"Push bildirimleri yapılandırılmadı." });
-  await sendPushToUser(req.session.userId, {
+  await addNotification(req.session.userId, null, "test", "🔔 TechAvı bildirimleri aktif", "Bildirim sistemi başarıyla bağlandı.", APP_URL);
+  const stats = await sendPushToUser(req.session.userId, {
     title: "🔔 TechAvı bildirimleri aktif",
     body: "Fiyat alarmın tetiklendiğinde telefonuna bildirim göndereceğiz.",
     url: APP_URL
   });
-  res.json({ ok:true });
+  if (!stats.sent) return res.status(409).json({ok:false,error:"Aktif push aboneliği bulunamadı. Bildirimleri yeniden açmayı dene.",stats});
+  res.json({ ok:true, stats });
 });
 
 app.get("/api/alarms", requireAuth, async (req, res) => {
   const r = await db(`
-    SELECT id,store,title,url,current_price,target_price,active,last_checked_at,triggered_at,created_at
+    SELECT id,store,title,url,current_price,target_price,alarm_type,percent_drop,baseline_price,stock_only,active,last_checked_at,triggered_at,created_at
     FROM alarms WHERE user_id=$1 ORDER BY created_at DESC
   `, [req.session.userId]);
   res.json({ ok: true, alarms: r.rows });
 });
 
 app.post("/api/alarms", requireAuth, async (req, res) => {
-  const storeAliases = {
-    "Trendyol": "trendyol",
-    "Hepsiburada": "hepsiburada",
-    "n11": "n11",
-    "MediaMarkt": "mediamarkt",
-    "Teknosa": "teknosa",
-    "Vatan": "vatan",
-    "Vatan Bilgisayar": "vatan",
-    "Amazon": "amazon",
-    "Amazon Türkiye": "amazon",
-    "Pazarama": "pazarama",
-    "Çiçeksepeti": "ciceksepeti",
-    "Boyner": "boyner",
-    "Morhipo": "boyner"
-  };
-  const rawStore = String(req.body.store || "").trim();
-  const store = storeAliases[rawStore] || rawStore.toLowerCase();
-  const title = String(req.body.title || "").trim();
-  const url = String(req.body.url || "").trim();
-  const productId = String(req.body.productId || "").trim();
-  const target = num(req.body.targetPrice);
-
-  if (!["trendyol", "hepsiburada", "n11", "mediamarkt", "teknosa", "vatan", "amazon", "pazarama", "ciceksepeti", "boyner"].includes(store) || !title || !target || target <= 0) {
-    return res.status(400).json({ ok: false, error: "Mağaza, ürün ve geçerli hedef fiyat gerekli." });
-  }
-
-  const r = await db(`
-    INSERT INTO alarms(user_id,store,product_id,title,url,target_price)
-    VALUES($1,$2,$3,$4,$5,$6)
-    RETURNING id,store,title,url,target_price,active,created_at
-  `, [req.session.userId, store, productId || null, title, url || null, target]);
-
-  res.json({ ok: true, alarm: r.rows[0] });
+  const storeAliases = {"Trendyol":"trendyol","Hepsiburada":"hepsiburada","n11":"n11","MediaMarkt":"mediamarkt","Teknosa":"teknosa","Vatan":"vatan","Vatan Bilgisayar":"vatan","Amazon":"amazon","Amazon Türkiye":"amazon","Pazarama":"pazarama","Çiçeksepeti":"ciceksepeti","Boyner":"boyner","Morhipo":"boyner"};
+  const rawStore=String(req.body.store||"").trim(); const store=storeAliases[rawStore]||rawStore.toLowerCase();
+  const title=String(req.body.title||"").trim(); const url=String(req.body.url||"").trim(); const productId=String(req.body.productId||"").trim();
+  const type=String(req.body.alarmType||"price"); const target=num(req.body.targetPrice); const percent=num(req.body.percentDrop); const baseline=num(req.body.baselinePrice); const stockOnly=type==="stock";
+  if(!SEARCH_STORES.includes(store)||!title) return res.status(400).json({ok:false,error:"Mağaza ve ürün gerekli."});
+  if(type==="price" && (!target||target<=0)) return res.status(400).json({ok:false,error:"Geçerli hedef fiyat gerekli."});
+  if(type==="percent" && (!percent||percent<=0||percent>=100)) return res.status(400).json({ok:false,error:"Geçerli düşüş yüzdesi gerekli."});
+  if(!["price","percent","low30","stock"].includes(type)) return res.status(400).json({ok:false,error:"Geçersiz alarm tipi."});
+  const r=await db(`INSERT INTO alarms(user_id,store,product_id,title,url,target_price,alarm_type,percent_drop,baseline_price,stock_only,current_price)
+    VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,[req.session.userId,store,productId||null,title,url||null,target||0,type,percent||null,baseline||null,stockOnly,baseline||null]);
+  res.json({ok:true,alarm:r.rows[0]});
 });
 
 app.delete("/api/alarms/:id", requireAuth, async (req, res) => {
@@ -1307,25 +1460,20 @@ app.delete("/api/alarms/:id", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
-async function fetchAlarmPrice(alarm) {
+async function fetchAlarmProduct(alarm) {
   const q = normalizeQuery(alarm.title);
   const result = await searchStore(alarm.store, q);
   const products = result.products || [];
-
+  recordProducts(products).catch(()=>{});
   const targetId = String(alarm.product_id || "");
   let best = products.find(p => String(p.id) === targetId);
   if (!best) {
     const titleTokens = q.split(" ").filter(Boolean).slice(0, 6);
-    best = products
-      .map(p => {
-        const t = normalizeQuery(p.title);
-        const score = titleTokens.filter(x => t.includes(x)).length;
-        return { p, score };
-      })
-      .sort((a,b) => b.score - a.score)[0]?.p;
+    best = products.map(p => { const t=normalizeQuery(p.title); return {p,score:titleTokens.filter(x=>t.includes(x)).length}; }).sort((a,b)=>b.score-a.score)[0]?.p;
   }
-  return best?.price ?? null;
+  return best || null;
 }
+async function fetchAlarmPrice(alarm) { return (await fetchAlarmProduct(alarm))?.price ?? null; }
 
 async function checkAlarms() {
   if (!DATABASE_URL || !REEF_API_KEY) return;
@@ -1339,13 +1487,24 @@ async function checkAlarms() {
 
     for (const alarm of r.rows) {
       try {
-        const price = await fetchAlarmPrice(alarm);
+        const matchedProduct = await fetchAlarmProduct(alarm);
+        const price = matchedProduct?.price ?? null;
         await db("UPDATE alarms SET current_price=$1,last_checked_at=NOW() WHERE id=$2", [price, alarm.id]);
 
-        if (price != null && price <= Number(alarm.target_price)) {
+        let trigger = false;
+        if (alarm.alarm_type === "stock") trigger = Boolean(matchedProduct && matchedProduct.stock !== false);
+        else if (alarm.alarm_type === "percent") trigger = price != null && Number(alarm.baseline_price||alarm.current_price||0)>0 && price <= Number(alarm.baseline_price||alarm.current_price) * (1 - Number(alarm.percent_drop||0)/100);
+        else if (alarm.alarm_type === "low30") {
+          const pk = `${alarm.store}:${alarm.product_id||""}`;
+          const q = await db(`SELECT MIN(price)::float m FROM price_history WHERE product_key=$1 AND observed_at>=NOW()-INTERVAL '30 days'`, [pk]);
+          trigger = price != null && q.rows[0]?.m != null && price <= Number(q.rows[0].m);
+        } else trigger = price != null && price <= Number(alarm.target_price);
+
+        if (trigger) {
           await db("UPDATE alarms SET active=false,triggered_at=NOW() WHERE id=$1", [alarm.id]);
 
           const user = await db("SELECT name,email FROM users WHERE id=$1", [alarm.user_id]);
+          await addNotification(alarm.user_id, alarm.id, "alarm", "🔔 TechAvı — alarm tetiklendi!", `${alarm.title} — ${Number(price||0).toLocaleString("tr-TR")} TL`, alarm.url || APP_URL);
           await sendPushToUser(alarm.user_id, {
             title: "🔔 TechAvı — fiyat düştü!",
             body: `${alarm.title} — ${Number(price).toLocaleString("tr-TR")} TL`,

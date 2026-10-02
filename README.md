@@ -46,3 +46,32 @@ Render Free dosya sistemi kalıcı değildir; bu yüzden kullanıcılar ve alarm
 ## Not
 
 Render Free web service 15 dakika trafik olmazsa uyur ve sonraki istekte yaklaşık 1 dakika içinde tekrar başlar. Bu uygulama koduyla çözülemez; sürekli açık kalması için ücretli Render compute gerekir.
+
+## TechAvı Pro özellikleri (v3)
+
+Bu sürüm mevcut arama altyapısını koruyup aşağıdaki özellikleri ekler:
+- 7 gün / 30 gün / 6 ay gerçek fiyat geçmişi ve çizgi grafik
+- 30 günlük dip / tüm zamanların dip fiyat bilgisi
+- fiyat düşüş yüzdesi ve fiyat kalitesi (iyi / normal / yüksek)
+- aynı/benzer ürünlerde mağaza karşılaştırması
+- hedef fiyat, yüzde düşüş, 30 gün dip ve stok alarmı
+- favorilerin hesapla senkronizasyonu ve takip listesi
+- alarm geçmişi ve bildirim merkezi
+- son aramalar ve 30 günlük popüler aramalar
+- kategori, fiyat, mağaza, marka, indirim, stok filtreleri
+- en ucuz / pahalı / en çok düşen / en yüksek indirim sıralaması
+- gerçek fırsatlar, fiyat düşüşleri, dip fiyatlar ve “Bugün ne düştü?”
+- benzer ürünler ve ürün detay ekranı
+- geliştirilmiş PWA/offline shell
+- daha sağlam Web Push abonelik yenileme ve test akışı
+- koyu/açık tema
+- e-posta/şifre hesabı + opsiyonel Google ile giriş
+
+### Yeni ortam değişkeni
+Google ile giriş isteniyorsa Render'a `GOOGLE_CLIENT_ID` ekleyin. Google OAuth Web Client ID olmadan normal e-posta/şifre girişi çalışmaya devam eder ve Google düğmesi gösterilmez.
+
+### Push için gerekli değişkenler
+`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `APP_URL`, `JOB_SECRET` ve `DATABASE_URL` ayarlı olmalıdır. Telefon push bildirimleri HTTPS üzerinde ve tarayıcı/site bildirim izni açıkken çalışır.
+
+### Fiyat geçmişi hakkında
+TechAvı sahte geçmiş üretmez. `price_history` tablosu ürün aramalarında ve alarm kontrollerinde gerçek gözlemlerle dolar. Bu nedenle yeni kurulumda grafik/fırsat listeleri zaman içinde zenginleşir.
