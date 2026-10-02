@@ -1,0 +1,17 @@
+TechAvı ReefAPI stabilite düzeltmesi
+
+Bu sürüm, önceki ZIP'teki kritik çelişkiyi düzeltir:
+- README'de ReefAPI kuyruğu olduğu yazıyordu ancak server.js gerçekte tüm
+  ReefAPI isteklerini aynı anda gönderiyordu.
+- ReefAPI istekleri artık en fazla 5 eşzamanlı istekle kuyruklanıyor.
+- Yeni API çağrısı eklenmedi; mağaza başına yine tek arama çağrısı var.
+- n11'in mevcut detay çağrıları da aynı kuyruğu kullanır.
+- Amazon/Bright Data kuyruğa alınmaz.
+- Ön yüzde mağazalar sonuçlandıkça gösterilmeye devam eder.
+- Mağaza başına timeout 50 saniyeye çıkarıldı; bu yalnızca kuyruk beklemesini
+  tolere etmek içindir.
+- Render ortam değişkenleri / API anahtarları ZIP'e eklenmez.
+
+Önerilen Render env:
+REEF_CONCURRENCY=5
+(İsterseniz env olmadan da çalışır; varsayılan 5'tir.)
